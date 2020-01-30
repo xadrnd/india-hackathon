@@ -1,0 +1,22 @@
+#!/usr/local/bin/python3
+
+import sys
+import time
+
+
+def main(argv):
+    """
+    Simply sends std in to std out at a slower rate. Feel free to change however you want.
+    """
+    counter = 0
+    sleep_interval = 1
+    for line in sys.stdin:
+        print(line)
+        counter += 1
+        if counter % 25 == 0:
+            sys.stdout.flush()
+            time.sleep(sleep_interval)
+
+
+if __name__ == "__main__":
+    main(sys.argv[0:])

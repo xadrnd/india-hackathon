@@ -1,0 +1,276 @@
+#!/usr/local/bin/python3
+
+import asyncio
+import heapq
+import re
+import sys
+import threading
+import time
+from collections import defaultdict
+from threading import Lock
+
+import tornado.web
+
+# ==== THIS WOULD GO IN README LATER ===========
+# When working with small files or control the input going in,
+# use the helper utility provided -
+# 'stream_flow_control' to slow down std-in like
+# cat words.txt | ./stream_flow_control| ./top_k_3
+# cat imdb_reviews.txt | ./stream_flow_control| ./top_k_3
+# You should be able to see output on http://localhost:8888/top
+# or the log file
+
+# ===== The globals(defaults) go here ===================
+MOST_FREQ_K_WORDS = 10  # Choose K
+# Every N seconds, your analysis time window gets reset. If 0, time window does not get reset, then top K is simply
+# beginning to end of stream in.
+TIME_WINDOW_SECONDS = 0
+UPDATE_FREQ_SECONDS = 2.0 + TIME_WINDOW_SECONDS / 2.0  # The frequency at which the logs get updated
+LOGFILE = 'logfile.txt'
+SERVER_PORT = 8888
+RESOURCE_URL = '/top'
+# ==============================================
+
+# ==== We can ignore filler words ==============
+FILLER_WORDS = {'a', 'an', 'as', 'at', 'of', 'the', 'The', 'is', 'this', 'and', 'to', 'too', 'that', 'in', 'was', 'his',
+                'but', 'for', 'with', 'I', 'on', 'are', 'be', 'have', 'you', 'not', 'from', 'it', 'he', 'she', 'they',
+                'by', 'has', 'who', 'all', 'his', 'her', 'so', 'about', 'like', 'or', 'very', 'out', 'my', 'their',
+                'when', 'who', 'where', 'more', 'some', 'just', 'It', 'if', 'what', 'which', "it's", 'would', 'can',
+                'were', 'than', 'one', 'will', 'This', 'only', 'up', 'down', 'had', 'been', 'other', '-', 'most',
+                'much', 'also', 'get', 'set', 'me', 'because', 'its', 'there', 'any', 'into', 'yes', 'no', 'him',
+                'her', 'how', 'then', 'we', 'many', 'do', "don't", 'dont', 'could', 'a', 'b', 'c', 'd', 'e', 'f', 'g',
+                'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'your',
+                'does', 'did', 'There', 'should', 'And', 'But', 'if', 'If', 'these', 'them', 're', 'off', 'said', 'He',
+                'them', 'did', 'now', 'went', 'before'}
+# ==============================================
+
+# Globals to manage thread collaboration
+stdin_condition_lock = Lock()
+is_stdin_active = True
+
+
+def main(argv):
+
+    most_freq_k_words = MOST_FREQ_K_WORDS
+    time_window_seconds = TIME_WINDOW_SECONDS
+
+    try:
+        if len(argv) > 2:
+            time_window_seconds = int(argv[2])
+            print("Setting time window:{} seconds".format(time_window_seconds))
+        if len(argv) > 1:
+            most_freq_k_words = int(argv[1])
+    except ValueError:
+        print("Error: Could not parse command-line.")
+        exit(1)
+
+    print("Starting Top:{} ..".format(most_freq_k_words))
+
+    # A thread-safe data structure to share data
+    sl = SynchronizedList()
+
+    # Logging task (to manage logging frequency)
+    logging_task = LogTask(0, "Logging", sl)
+    logging_task.start()
+
+    # The embedded web server
+    server_task = ServerTask(1, "WebServer", sl)
+    server_task.setDaemon(True) # When stream in job finishes, the web server should go down automatically
+    server_task.start()
+
+    # You have to implement this and write test cases
+    stream_in_task(most_freq_k_words, time_window_seconds, sl)
+
+    logging_task.join()
+    print("====Ended Top K===")
+
+
+class SynchronizedList:
+    """
+    Shared memory among collaborating threads
+    """
+
+    def __init__(self):
+        self.__list = []
+        self.__lock = Lock()
+
+    def get_all(self):
+        with self.__lock:
+            return [i for i in self.__list]
+
+    def add_all(self, items):
+        with self.__lock:
+            self.__list.clear()
+            for i in items:
+                self.__list.append(i)
+
+    def __str__(self):
+        with self.__lock:
+            return "{}".format(self.__list)
+
+
+class EmbeddedServer(tornado.web.Application):
+
+    """
+    Embedded Web Server that runs in the same process
+    """
+    def __init__(self, sl):
+        handlers = [(r"{}".format(RESOURCE_URL), ReqHandler, dict(sl=sl)), ]
+        settings = {'debug': False}
+        super().__init__(handlers, **settings)
+
+    def run(self):
+        self.listen(SERVER_PORT)
+        tornado.ioloop.IOLoop.instance().start()
+
+
+class ReqHandler(tornado.web.RequestHandler):
+
+    """
+    Request Handler
+    """
+    def initialize(self, sl):
+        self.__sl = sl
+
+    def get(self):
+        self.write("Top words:{}".format(self.__sl))
+
+
+class ServerTask(threading.Thread):
+    """
+    Starting the web server in its own thread
+    """
+    def __init__(self, taskid, name, slist):
+        super().__init__()
+        self.__taskid = taskid
+        self.__name = name
+        self.__ws = EmbeddedServer(slist)
+
+    def run(self):
+        print("Running {}:{}".format(self.__taskid, self.__name))
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        self.__ws.run()
+
+
+class LogTask(threading.Thread):
+    """
+    Just separating logging from the stream in task for convenience
+    """
+    def __init__(self, taskid, name, slist):
+        super().__init__()
+        self.__taskid = taskid
+        self.__name = name
+        self.__sl = slist
+        self.__file = open(LOGFILE, 'w')
+        self.__counter = 0
+
+    def run(self):
+
+        print("Running {}:{}".format(self.__taskid, self.__name))
+        while is_stdin_active:
+            time.sleep(UPDATE_FREQ_SECONDS)
+            top_k = self.__sl.get_all()
+            self.__file.write("Counter:{}\n".format(self.__counter))
+            self.__file.write("{}\n".format(top_k))
+            self.__file.write("====" * 10)
+            self.__file.write("\n")
+            self.__counter += 1
+            self.__file.flush()
+        print("Stopped logging task.")
+
+
+"""
+Reads stdin and computes the most-frequently seen words in a time window.
+"""
+
+
+def stream_in_task(most_freq_k_words, time_window_seconds, sync_list):
+    """
+    Reads stdin till its available and keeps track of the top K words in the set time window
+    :param most_freq_k_words: int
+    :param time_window_seconds: int
+    :param sync_list: synchronized list
+    :return: None
+    """
+
+    global is_stdin_active
+    stdin_condition_lock.acquire()
+
+    word_dict = defaultdict(int)
+    word_heap = []
+
+    start_time = time.time()
+    for line in sys.stdin:
+        # Every time_window_seconds, data structures get reset
+        if 0 < time_window_seconds < time.time() - start_time:
+            word_dict.clear()
+            word_heap.clear()
+            start_time = time.time()
+            print("Clearing all data structures ...")
+
+        words = re.findall(r'[\w]+', line)  # The words you find are as good as the regex here
+        for word in words:
+            if word in FILLER_WORDS:  # Ignore filler words
+                continue
+            is_heap_changed = False  # For optimizing: if heap is not refreshed, don't update sync list
+            word_dict[word] += 1
+            # top of heap is lowest frequency word; heap node is a tuple (count, word)
+            if word_heap and word_heap[0][0] >= word_dict[word]:
+                continue
+            # if word count at top of heap is smaller, then update heap
+            elif word_heap and word_heap[0][0] < word_dict[word]:
+                is_heap_changed = True
+                to_be_pushed = (word_dict[word], word)
+                popped_list = []
+                heapq.heappush(word_heap, to_be_pushed)  # This is 1 extra word now in heap
+
+                while word_heap:
+                    # [1] There may already be the same word with one less count in the heap already,
+                    # look for it and take it out
+                    if word_heap[0][0] < word_dict[word] and word_heap[0][1] == word:
+                        heapq.heappop(word_heap)
+                    # [2] if root of heap has a greater count, we have exhausted our search
+                    elif word_heap[0][0] >= word_dict[word]:
+                        break
+                    # [3] count is same as current word count but we dont know if same word can appear with stale
+                    # count so we keep on popping and add back the other words later
+                    elif word_heap[0][1] != word:
+                        pop = heapq.heappop(word_heap)
+                        popped_list.append(pop)
+
+                for popped in popped_list:  # Add back all the word we popped in [3]
+                    heapq.heappush(word_heap, popped)
+
+                while len(word_heap) > most_freq_k_words:  # Pop out the extra word we may have put before
+                    heapq.heappop(word_heap)
+
+            else:
+                # No need to create heap until most_freq_k_words are seen
+                if len(word_dict) == most_freq_k_words:
+                    for key in word_dict:
+                        word_heap.append((word_dict[key], key))
+                    heapq.heapify(word_heap)
+                    is_heap_changed = True
+                    print("Heap created/re-created ...")
+
+            if is_heap_changed:
+                sync_list.add_all(sorted(word_heap, reverse=True))
+
+    is_stdin_active = False
+    stdin_condition_lock.release()
+
+    if len(word_dict) == 0:
+        print ("ERROR: Could not parse any words")
+        exit(1)
+    elif most_freq_k_words > len(word_dict):
+        words = [(v,x) for x,v in word_dict.items()]
+        words.sort(reverse = True)
+        sync_list.add_all(words)
+
+    print("WORD HEAP LEN:{}".format(len(word_heap)))
+    print("DICT LENGTH:{}".format(len(word_dict)))
+    print("Finished streaming in.")
+
+
+if __name__ == "__main__":
+    main(sys.argv[0:])
